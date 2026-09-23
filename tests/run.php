@@ -171,4 +171,62 @@ try {
     check($exception->errorCode === 'replayed_request', 'Wrong replay error');
 }
 
-echo "All unit tests passed.\n";
+
+// Moderation regressions: use the real repositories with an isolated in-memory DB.
+$account = $other['account']['account_id'];
+$owned->updatePublisher($account, ['display_name' => 'Review Publisher']);
+$owned->create($account, ['package_id'=>'review.public', 'title'=>'Review', 'description'=>'Original description', 'language'=>'en', 'visibility'=>'PUBLIC']);
+$docs = ['documents'=>[['id'=>'one','title'=>'Guide','content'=>'Original approved text']]];
+$draft = $versions->publish($account, 'review.public', $docs);
+check($draft['status'] === 'draft', 'Submission must be a draft');
+check($owned->get($account, 'review.public')['status'] === 'draft', 'Submission must not publish the collection');
+$adminApi->updateSubscription('review.public', ['is_featured'=>true]);
+$public = new NeonLib\SubscriptionRepository($database);
+check(count($public->featured()) === 0, 'Unapproved collection leaked through public search');
+function expectReviewError(callable $action, string $code): void {
+    try { $action(); } catch (ApiException $e) { check($e->errorCode === $code, 'Unexpected error: '.$e->errorCode); return; }
+    throw new RuntimeException('Expected error: '.$code);
+}
+expectReviewError(fn() => $adminApi->updateSubscription('review.public', ['status'=>'published']), 'review_required');
+$review = $adminApi->subscription('review.public')['review'];
+check($review['documents'][0]['content'] === 'Original approved text', 'Admin must see the actual documents');
+$approve = fn(array $r) => $adminApi->updateSubscription('review.public', ['approve_version'=>(int)$r['version']['version_number'], 'review_token'=>$r['review_token']]);
+$approve($review);
+check(count($public->featured()) === 1, 'Approved collection missing');
+$servedVersion = $public->manifest('review.public')['version'];
+$oldReview = $adminApi->subscription('review.public')['review'];
+$versions->publish($account, 'review.public', ['documents'=>[['id'=>'one','title'=>'Guide','content'=>'Unapproved changed text']]]);
+check($public->manifest('review.public')['version'] === $servedVersion, 'New submission replaced approved content');
+expectReviewError(fn() => $approve($oldReview), 'review_changed');
+$review = $adminApi->subscription('review.public')['review'];
+$owned->update($account, 'review.public', ['description'=>'Changed description']);
+check(count($public->featured()) === 0, 'Unapproved metadata leaked');
+expectReviewError(fn() => $approve($review), 'review_changed');
+$approve($adminApi->subscription('review.public')['review']);
+check((int)$public->manifest('review.public')['version'] === 2, 'Approval failed to switch version');
+check($adminApi->subscription('review.public')['pending_count'] === 0, 'Approved drafts remain in the queue');
+$review = $adminApi->subscription('review.public')['review'];
+$owned->updatePublisher($account, ['display_name'=>'Changed publisher']);
+check(count($public->featured()) === 0, 'Publisher rename bypassed moderation');
+expectReviewError(fn() => $approve($review), 'review_changed');
+$approve($adminApi->subscription('review.public')['review']);
+$adminApi->updateSubscription('review.public', ['status'=>'archived']);
+check(count($public->featured()) === 0, 'Archived collection is public');
+expectReviewError(fn() => $versions->publish($account, 'review.public', $docs), 'subscription_archived');
+$owned->update($account, 'review.public', ['title'=>'Archived edit']);
+check($owned->get($account, 'review.public')['status'] === 'archived', 'Metadata edit reactivated archive');
+expectReviewError(fn() => $approve($adminApi->subscription('review.public')['review']), 'subscription_archived');
+$adminApi->updateSubscription('review.public', ['status'=>'draft']);
+$approve($adminApi->subscription('review.public')['review']);
+check($owned->get($account, 'review.public')['status'] === 'published', 'Administrator could not reopen/review archive');
+check((int)$database->query("SELECT COUNT(*) FROM admin_audit_log WHERE event_type = 'admin_version_approved'")->fetchColumn() === 4, 'Approval audit entries missing');
+// Audit failures must roll back both the approval and published pointer.
+$versions->publish($account, 'review.public', $docs);
+$review = $adminApi->subscription('review.public')['review'];
+$database->exec('DROP TABLE admin_audit_log');
+try { $approve($review); throw new RuntimeException('Missing audit table should fail approval'); }
+catch (PDOException $e) {}
+check((int)$public->manifest('review.public')['version'] === 2, 'Failed approval changed public version');
+check(!$database->inTransaction(), 'Approval left transaction open');
+
+echo "All unit tests passed (including moderation regressions).\n";

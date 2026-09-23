@@ -30,6 +30,7 @@ final class OwnedSubscriptionRepository
         }
 
         $existing = $this->publisher($accountId);
+        if ($existing !== null && $existing['display_name'] === $name) return $existing;
         if ($existing === null) {
             $slug = 'account-' . substr($accountId, 4);
             $statement = $this->database->prepare(
@@ -37,10 +38,19 @@ final class OwnedSubscriptionRepository
             );
             $statement->execute(['account' => $accountId, 'slug' => $slug, 'name' => $name]);
         } else {
-            $statement = $this->database->prepare(
-                'UPDATE publishers SET name = :name WHERE owner_account_id = :account'
-            );
-            $statement->execute(['account' => $accountId, 'name' => $name]);
+            $this->database->beginTransaction();
+            try {
+                $statement = $this->database->prepare('UPDATE publishers SET name = :name WHERE owner_account_id = :account');
+                $statement->execute(['account' => $accountId, 'name' => $name]);
+                { // Every actual rename invalidates existing approvals.
+                    $this->database->prepare("UPDATE subscriptions SET status = 'DRAFT' WHERE owner_account_id = :account AND status = 'PUBLISHED'")
+                        ->execute(['account' => $accountId]);
+                }
+                $this->database->commit();
+            } catch (\Throwable $error) {
+                if ($this->database->inTransaction()) $this->database->rollBack();
+                throw $error;
+            }
         }
 
         return $this->publisher($accountId) ?? throw new \RuntimeException('Publisher profile was not persisted.');
@@ -101,7 +111,7 @@ final class OwnedSubscriptionRepository
         $sets = [];
         foreach ($values as $column => $_) $sets[] = $column . ' = :' . $column;
         $statement = $this->database->prepare(
-            'UPDATE subscriptions SET ' . implode(', ', $sets) .
+            "UPDATE subscriptions SET status = CASE WHEN status = 'ARCHIVED' THEN 'ARCHIVED' ELSE 'DRAFT' END, " . implode(', ', $sets) .
             ' WHERE owner_account_id = :account AND package_id = :current_package'
         );
         try {

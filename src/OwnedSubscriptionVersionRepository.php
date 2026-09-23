@@ -55,11 +55,14 @@ final class OwnedSubscriptionVersionRepository
         try {
             $lock = $this->database->getAttribute(PDO::ATTR_DRIVER_NAME) === 'mysql' ? ' FOR UPDATE' : '';
             $subscription = $this->database->prepare(
-                'SELECT id FROM subscriptions WHERE owner_account_id = :account AND package_id = :package' . $lock
+                'SELECT id, status FROM subscriptions WHERE owner_account_id = :account AND package_id = :package' . $lock
             );
             $subscription->execute(['account' => $accountId, 'package' => $packageId]);
-            $subscriptionId = $subscription->fetchColumn();
+            $row = $subscription->fetch(PDO::FETCH_ASSOC);
+            $subscriptionId = $row ? $row['id'] : false;
             if ($subscriptionId === false) throw new ApiException(404, 'subscription_not_found', 'Subscription not found.');
+
+            if ($row['status'] === 'ARCHIVED') throw new ApiException(409, 'subscription_archived', 'An administrator must reopen this subscription before submission.');
 
             $next = $this->database->prepare(
                 'SELECT COALESCE(MAX(version_number), 0) + 1 FROM subscription_versions WHERE subscription_id = :subscription'
@@ -72,7 +75,7 @@ final class OwnedSubscriptionVersionRepository
             $versionInsert = $this->database->prepare(
                 "INSERT INTO subscription_versions
                  (subscription_id, version_number, document_count, content_bytes, content_sha256, status, published_at)
-                 VALUES (:subscription, :number, :count, :bytes, :hash, 'PUBLISHED', CURRENT_TIMESTAMP)"
+                 VALUES (:subscription, :number, :count, :bytes, :hash, 'DRAFT', NULL)"
             );
             $versionInsert->execute(['subscription' => $subscriptionId, 'number' => $versionNumber,
                 'count' => count($documents), 'bytes' => strlen($contentJson), 'hash' => hash('sha256', $contentJson)]);
@@ -85,10 +88,9 @@ final class OwnedSubscriptionVersionRepository
                 $documentInsert->execute(['version' => $versionId, 'key' => $document['id'], 'title' => $document['title'],
                     'content' => $document['content'], 'sort' => ($index + 1) * 10]);
             }
-            $publish = $this->database->prepare(
-                "UPDATE subscriptions SET status = 'PUBLISHED', published_version_id = :version WHERE id = :subscription"
-            );
-            $publish->execute(['version' => $versionId, 'subscription' => $subscriptionId]);
+            // Submitting does not change the version served to readers.
+            $this->database->prepare('UPDATE subscriptions SET updated_at = CURRENT_TIMESTAMP WHERE id = :id')
+                ->execute(['id' => $subscriptionId]);
             $this->database->commit();
             return $this->get($accountId, $packageId, $versionNumber);
         } catch (Throwable $exception) {
@@ -100,7 +102,7 @@ final class OwnedSubscriptionVersionRepository
     private function subscriptionId(string $accountId, string $packageId): int
     {
         $query = $this->database->prepare(
-            'SELECT id FROM subscriptions WHERE owner_account_id = :account AND package_id = :package LIMIT 1'
+            'SELECT id, status FROM subscriptions WHERE owner_account_id = :account AND package_id = :package LIMIT 1'
         );
         $query->execute(['account' => $accountId, 'package' => $packageId]);
         $id = $query->fetchColumn();

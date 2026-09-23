@@ -58,7 +58,7 @@ final class AdminApiRepository
         $status = strtoupper(trim((string) ($query['status'] ?? '')));
         if ($status !== '' && !in_array($status, ['DRAFT', 'PUBLISHED', 'ARCHIVED'], true)) throw new ApiException(422, 'invalid_filter', 'Invalid subscription status filter.');
         $sql = 'SELECT s.package_id, s.owner_account_id, s.title, s.language, s.visibility, s.status, s.is_featured,
-                       s.created_at, s.updated_at, p.slug AS publisher_slug
+                       s.created_at, s.updated_at, p.slug AS publisher_slug, (SELECT COUNT(*) FROM subscription_versions pending WHERE pending.subscription_id = s.id AND pending.status = \'DRAFT\') AS pending_count
                 FROM subscriptions s JOIN publishers p ON p.id = s.publisher_id WHERE 1=1';
         $params = [];
         if ($status !== '') { $sql .= ' AND s.status = :status'; $params['status'] = $status; }
@@ -72,19 +72,30 @@ final class AdminApiRepository
     {
         $statement = $this->database->prepare(
             'SELECT s.package_id, s.owner_account_id, s.title, s.language, s.visibility, s.status, s.is_featured,
-                    s.created_at, s.updated_at, p.slug AS publisher_slug
+                    s.created_at, s.updated_at, p.slug AS publisher_slug, (SELECT COUNT(*) FROM subscription_versions pending WHERE pending.subscription_id = s.id AND pending.status = \'DRAFT\') AS pending_count
              FROM subscriptions s JOIN publishers p ON p.id = s.publisher_id WHERE s.package_id = :package LIMIT 1'
         );
         $statement->execute(['package' => $packageId]); $row = $statement->fetch();
         if (!$row) throw new ApiException(404, 'subscription_not_found', 'Subscription not found.');
-        return $this->subscriptionResponse($row);
+        $response = $this->subscriptionResponse($row);
+        $response['review'] = (new SubscriptionReview($this->database))->get($packageId);
+        return $response;
     }
 
     public function updateSubscription(string $packageId, array $input): array
     {
+        if (isset($input['approve_version'])) {
+            (new SubscriptionReview($this->database))->approve($packageId, $input, $this->adminUserId);
+            return $this->subscription($packageId);
+        }
+        if (strtoupper((string) ($input['status'] ?? '')) === 'PUBLISHED') {
+            throw new ApiException(422, 'review_required', 'Open the document review and approve the reviewed version.');
+        }
         $allowed = ['status', 'visibility', 'is_featured'];
         if ($input === [] || array_diff(array_keys($input), $allowed)) throw new ApiException(422, 'validation_failed', 'Only status, visibility and is_featured are editable.');
         $values = []; $sets = [];
+        // Changing visibility also requires a fresh approval. Preserve archive.
+        if (isset($input['visibility']) && !isset($input['status'])) $sets[] = "status = CASE WHEN status = 'ARCHIVED' THEN 'ARCHIVED' ELSE 'DRAFT' END";
         if (isset($input['status'])) { $value = strtoupper((string) $input['status']); if (!in_array($value, ['DRAFT','PUBLISHED','ARCHIVED'], true)) throw new ApiException(422,'validation_failed','Invalid status.'); $values['status']=$value; $sets[]='status = :status'; }
         if (isset($input['visibility'])) { $value = strtoupper((string) $input['visibility']); if (!in_array($value,['PUBLIC','PRIVATE'],true)) throw new ApiException(422,'validation_failed','Invalid visibility.'); $values['visibility']=$value; $sets[]='visibility = :visibility'; }
         if (array_key_exists('is_featured',$input)) { if (!is_bool($input['is_featured'])) throw new ApiException(422,'validation_failed','is_featured must be boolean.'); $values['featured']=$input['is_featured']?1:0; $sets[]='is_featured = :featured'; }
@@ -102,5 +113,5 @@ final class AdminApiRepository
     }
 
     private function accountResponse(array $row): array { return ['account_id'=>$row['account_id'],'status'=>strtolower($row['status']),'subscription_count'=>(int)$row['subscription_count'],'active_link_count'=>(int)$row['active_link_count'],'created_at'=>$row['created_at'],'updated_at'=>$row['updated_at']]; }
-    private function subscriptionResponse(array $row): array { return ['package_id'=>$row['package_id'],'account_id'=>$row['owner_account_id'],'publisher_slug'=>$row['publisher_slug'],'title'=>$row['title'],'language'=>$row['language'],'visibility'=>strtolower($row['visibility']),'status'=>strtolower($row['status']),'is_featured'=>(bool)$row['is_featured'],'created_at'=>$row['created_at'],'updated_at'=>$row['updated_at']]; }
+    private function subscriptionResponse(array $row): array { return ['pending_count'=>(int)$row['pending_count'],'package_id'=>$row['package_id'],'account_id'=>$row['owner_account_id'],'publisher_slug'=>$row['publisher_slug'],'title'=>$row['title'],'language'=>$row['language'],'visibility'=>strtolower($row['visibility']),'status'=>strtolower($row['status']),'is_featured'=>(bool)$row['is_featured'],'created_at'=>$row['created_at'],'updated_at'=>$row['updated_at']]; }
 }

@@ -41,6 +41,26 @@ try {
         $portal->handle($method, $path);
     }
 
+    if ($path === '/api/v1/reports') {
+        if ($method !== 'POST') throw new ApiException(405, 'method_not_allowed', 'Only POST is supported.');
+        $body = file_get_contents('php://input', false, null, 0, 65537);
+        if ($body === false || strlen($body) > 65536) throw new ApiException(413, 'request_too_large', 'Report exceeds 64 KiB.');
+        $secret = (string)($_ENV['REPORT_RATE_LIMIT_SECRET'] ?? $_ENV['WORDPRESS_CLIENT_SECRET'] ?? '');
+        $result = (new NeonLib\ReportRepository(Database::connection()))->submit(JsonBody::decode($body), (string)($_SERVER['REMOTE_ADDR'] ?? 'unknown'), $secret);
+        JsonResponse::send(['requestId'=>RequestContext::id(), 'data'=>$result], 201);
+    }
+    if ($path === '/api/v1/admin/reports' || preg_match('#^/api/v1/admin/reports/([a-f0-9-]{36})$#', $path, $reportMatch)) {
+        $collection = $path === '/api/v1/admin/reports';
+        if (($collection && $method !== 'GET') || (!$collection && $method !== 'PATCH')) throw new ApiException(405, 'method_not_allowed', 'Unsupported report method.');
+        $database = Database::connection();
+        $adminId = (new AdminApiAuthenticator($database))->authenticate($_SERVER);
+        $reports = new NeonLib\ReportRepository($database);
+        if ($collection) JsonResponse::send(['requestId'=>RequestContext::id(),'data'=>$reports->list($_GET)]);
+        $body=file_get_contents('php://input', false, null, 0, 16385);
+        if ($body===false || strlen($body)>16384) throw new ApiException(413,'request_too_large','Report update too large.');
+        JsonResponse::send(['requestId'=>RequestContext::id(),'data'=>$reports->update($reportMatch[1],JsonBody::decode($body),$adminId)]);
+    }
+
     if ($path === '/api/v1/accounts/link') {
         if (!in_array($method, ['POST', 'GET', 'PUT', 'DELETE'], true)) {
             throw new ApiException(405, 'method_not_allowed', 'Supported methods are POST, GET, PUT and DELETE.');
