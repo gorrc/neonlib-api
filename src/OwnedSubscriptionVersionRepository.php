@@ -110,7 +110,7 @@ final class OwnedSubscriptionVersionRepository
         return (int) $id;
     }
 
-    private function validateDocuments(mixed $input): array
+    public function validateDocuments(mixed $input): array
     {
         if (!is_array($input) || !array_is_list($input) || $input === [] || count($input) > self::MAX_DOCUMENTS) {
             throw new ApiException(422, 'validation_failed', 'Documents must be a non-empty list of at most 500 items.');

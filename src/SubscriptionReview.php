@@ -19,7 +19,7 @@ final class SubscriptionReview
         $query->execute(['package' => $packageId]);
         $subscription = $query->fetch(PDO::FETCH_ASSOC);
         if (!$subscription) throw new ApiException(404, 'subscription_not_found', 'Subscription not found.');
-        $query = $this->database->prepare('SELECT id, version_number, content_sha256 FROM subscription_versions
+        $query = $this->database->prepare('SELECT id, version_number, content_sha256, status FROM subscription_versions
             WHERE subscription_id = :id ORDER BY version_number DESC LIMIT 1');
         $query->execute(['id' => $subscription['id']]);
         $version = $query->fetch(PDO::FETCH_ASSOC);

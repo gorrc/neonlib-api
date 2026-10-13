@@ -79,11 +79,17 @@ final class AdminApiRepository
         if (!$row) throw new ApiException(404, 'subscription_not_found', 'Subscription not found.');
         $response = $this->subscriptionResponse($row);
         $response['review'] = (new SubscriptionReview($this->database))->get($packageId);
+        $response['editor'] = (new AdminSubscriptionEditor($this->database))->snapshot($packageId);
         return $response;
     }
 
     public function updateSubscription(string $packageId, array $input): array
     {
+        if (array_key_exists('edit', $input)) {
+            if (count($input) !== 1 || !is_array($input['edit'])) throw new ApiException(422, 'validation_failed', 'Only the edit object is accepted.');
+            (new AdminSubscriptionEditor($this->database))->save($packageId, $input['edit'], $this->adminUserId);
+            return $this->subscription($packageId);
+        }
         if (isset($input['approve_version'])) {
             (new SubscriptionReview($this->database))->approve($packageId, $input, $this->adminUserId);
             return $this->subscription($packageId);
@@ -104,6 +110,39 @@ final class AdminApiRepository
         $statement->execute($values + ['package'=>$packageId]); if ($statement->rowCount()===0) $this->subscription($packageId);
         $this->audit('admin_subscription_moderated', $packageId, $input);
         return $this->subscription($packageId);
+    }
+
+    public function deleteSubscriptions(array $input): array
+    {
+        $ids = $input['package_ids'] ?? null;
+        if (array_diff(array_keys($input), ['package_ids', 'confirm']) || ($input['confirm'] ?? false) !== true ||
+            !is_array($ids) || !array_is_list($ids) || count($ids) < 1 || count($ids) > 100) {
+            throw new ApiException(422, 'validation_failed', 'Confirm deletion of 1–100 selected collections.');
+        }
+        foreach ($ids as $id) {
+            if (!is_string($id) || !preg_match('/^[a-z0-9][a-z0-9._-]{1,189}$/', $id)) throw new ApiException(422, 'validation_failed', 'Invalid package ID.');
+        }
+        $ids = array_values(array_unique($ids));
+        sort($ids);
+        $this->database->beginTransaction();
+        try {
+            $lock = $this->database->getAttribute(PDO::ATTR_DRIVER_NAME) === 'mysql' ? ' FOR UPDATE' : '';
+            $query = $this->database->prepare('SELECT id, package_id FROM subscriptions WHERE package_id IN (' . implode(',', array_fill(0, count($ids), '?')) . ') ORDER BY id' . $lock);
+            $query->execute($ids);
+            $rows = $query->fetchAll(PDO::FETCH_ASSOC);
+            if (count($rows) !== count($ids)) throw new ApiException(409, 'subscriptions_changed', 'Some collections no longer exist. Refresh the list.');
+            $delete = $this->database->prepare('DELETE FROM subscriptions WHERE id = :id');
+            foreach ($rows as $row) {
+                // Schema cascades to versions and documents. Audit must succeed in the same transaction.
+                $this->audit('admin_subscription_deleted', $row['package_id'], ['permanent'=>true]);
+                $delete->execute(['id'=>$row['id']]);
+            }
+            $this->database->commit();
+            return ['deleted'=>count($rows)];
+        } catch (\Throwable $error) {
+            if ($this->database->inTransaction()) $this->database->rollBack();
+            throw $error;
+        }
     }
 
     private function audit(string $event, ?string $packageId, array $details): void

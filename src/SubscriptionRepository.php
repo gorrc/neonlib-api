@@ -12,6 +12,24 @@ final class SubscriptionRepository
     {
     }
 
+    public function availability(string $ids): array
+    {
+        $packages = array_values(array_unique(explode(',', $ids)));
+        if (count($packages) > 50) throw new ApiException(422, 'invalid_packages', 'At most 50 packages.');
+        foreach ($packages as $id) {
+            if (!preg_match('/^[a-z0-9][a-z0-9._-]{1,189}$/', $id)) throw new ApiException(422, 'invalid_packages', 'Invalid package ID.');
+        }
+        $query = $this->database->prepare("SELECT s.package_id FROM subscriptions s
+            JOIN subscription_versions v ON v.id=s.published_version_id
+            WHERE s.package_id IN (" . implode(',', array_fill(0, count($packages), '?')) . ")
+            AND s.status='PUBLISHED' AND s.visibility='PUBLIC' AND v.status='PUBLISHED'");
+        $query->execute($packages);
+        $available = $query->fetchAll(PDO::FETCH_COLUMN);
+        // Never expose private titles, owners, draft status or whether an unknown ID exists.
+        return array_map(static fn(string $id): array => ['packageId'=>$id,
+            'status'=>in_array($id, $available, true) ? 'AVAILABLE' : 'UNAVAILABLE'], $packages);
+    }
+
     public function featured(): array
     {
         $statement = $this->database->query(
@@ -110,7 +128,7 @@ final class SubscriptionRepository
         );
         $statement->execute(['version_id' => $subscription['version_id']]);
 
-        return [
+        return (new PreparedVectorStore())->attach([
             'packageId' => $subscription['package_id'],
             'version' => (int) $subscription['version_number'],
             'documents' => array_map(static fn (array $row): array => [
@@ -118,7 +136,7 @@ final class SubscriptionRepository
                 'title' => $row['title'],
                 'content' => $row['content'],
             ], $statement->fetchAll()),
-        ];
+        ]);
     }
 
     private function publishedSubscription(string $packageId): array
